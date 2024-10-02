@@ -36,3 +36,13 @@
     transform: rotate(360deg);
   }
 }
+
+/* src/App.css */
+h1 {
+    color: #2c3e50;
+    text-align: center;
+}
+
+ul.list-group {
+    margin-top: 20px;
+}
