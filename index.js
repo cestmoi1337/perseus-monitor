@@ -30,7 +30,10 @@ const db = new sqlite3.Database('./perseus.db', (err) => {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 website_url TEXT NOT NULL,
                 keyword TEXT NOT NULL,
-                last_notified_article TEXT
+                last_notified_article TEXT,
+                notified TEXT,
+                last_notified TIMESTAMP
+
             )
         `, (err) => {
             if (err) {
@@ -113,7 +116,7 @@ app.delete('/sites/:id', (req, res) => {
 });
 
 // Schedule a task to run every 30 minutes (adjust the interval as needed)
-//cron.schedule('*/30 * * * *', () => {
+//cron.schedule('*/10 * * * *', () => {
         // Schedule a task to run every minute for testing purposes.
 cron.schedule('* * * * *', () => { 
     console.log('Running the scheduled job to check websites for keywords.');
@@ -125,11 +128,22 @@ app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
 });
 
+// Function to normalize the URLs
+const normalizeUrl = (url) => {
+    try {
+        const normalized = new URL(url).href;
+        return normalized.replace(/\/$/, ''); // Remove trailing slash for consistent comparison
+    } catch (e) {
+        console.error('Error normalizing URL:', url, e.message);
+        return url;
+    }
+};
+
+
 // Function to check websites for keywords
 const checkWebsitesForKeywords = () => {
-    const query = `
-        SELECT id, website_url, keyword, last_notified_article FROM monitored_sites
-    `;
+    // Fetch the websites and keywords from the database
+    const query = `SELECT id, website_url, keyword, last_notified_article FROM monitored_sites`;
 
     db.all(query, [], (err, rows) => {
         if (err) {
@@ -137,7 +151,6 @@ const checkWebsitesForKeywords = () => {
             return;
         }
 
-        // For each website and keyword combination, check the website content
         rows.forEach((row) => {
             axios.get(row.website_url)
                 .then((response) => {
@@ -146,17 +159,18 @@ const checkWebsitesForKeywords = () => {
                     let keywordFound = false;
                     let articleHeading = '';
                     let articleLink = '';
-                    let articleText = '';
+
+                    console.log(`Checking for keyword "${row.keyword}" on ${row.website_url}`);
 
                     // Search for the keyword in the website content
                     $('h1, h2, a').each((index, element) => {
                         const headingText = $(element).text().toLowerCase();
                         let link = $(element).attr('href'); // Get the href attribute (link)
 
+                        // Check if the keyword exists in the heading text
                         if (headingText.includes(row.keyword.toLowerCase())) {
                             keywordFound = true;
                             articleHeading = $(element).text();
-                            articleText = $('body').text();  // Get the article's body text
 
                             // Handle relative URLs by checking if the link is absolute
                             if (link && !link.startsWith('http')) {
@@ -165,41 +179,15 @@ const checkWebsitesForKeywords = () => {
                             }
 
                             articleLink = link || row.website_url;
-
-                            // If this article has already been notified, skip it
-                            if (articleLink === row.last_notified_article) {
-                                console.log(`Article already notified for ${row.keyword} on ${row.website_url}. Skipping.`);
-                                return false;  // Stop processing this article
-                            }
-
-                            // Stop after finding the first relevant article
-                            return false;
+                            return false;  // Stop after finding the first relevant article
                         }
                     });
 
+                    // If the keyword is found, delegate to the notification handling function
                     if (keywordFound) {
-                        console.log(`Keyword "${row.keyword}" found on ${row.website_url}. Performing sentiment analysis...`);
-
-                        // Perform sentiment analysis on the article text
-                        const sentimentResult = sentiment.analyze(articleText);
-                        const sentimentScore = sentimentResult.score;
-
-                        let sentimentSummary = 'Neutral';
-                        if (sentimentScore > 0) sentimentSummary = 'Positive';
-                        if (sentimentScore < 0) sentimentSummary = 'Negative';
-
-                        // Send email notification with sentiment analysis included
-                        sendEmailNotification(row.website_url, row.keyword, articleHeading, articleLink, sentimentSummary, sentimentScore);
-
-                        // Update the last_notified_article field in the database
-                        const updateQuery = `UPDATE monitored_sites SET last_notified_article = ? WHERE id = ?`;
-                        db.run(updateQuery, [articleLink, row.id], (err) => {
-                            if (err) {
-                                console.error('Error updating last_notified_article:', err.message);
-                            } else {
-                                console.log(`Updated last_notified_article for ${row.website_url}`);
-                            }
-                        });
+                        handleNotification(row, articleHeading, articleLink);
+                    } else {
+                        console.log(`No matching keyword found for "${row.keyword}" on ${row.website_url}.`);
                     }
                 })
                 .catch((error) => {
@@ -208,6 +196,50 @@ const checkWebsitesForKeywords = () => {
         });
     });
 };
+
+// Function to handle sending notifications and preventing duplicates
+const handleNotification = (row, articleHeading, articleLink) => {
+    const lastNotifiedArticle = row.last_notified_article ? normalizeUrl(row.last_notified_article) : null;
+    const currentArticle = normalizeUrl(articleLink);
+
+    console.log(`Last Notified Article: ${lastNotifiedArticle}, Current Article: ${currentArticle}`);
+
+    // Check if the article has already been notified
+    if (lastNotifiedArticle === currentArticle) {
+        console.log(`Article already notified for "${row.keyword}" on ${row.website_url}. Skipping.`);
+        return;
+    }
+
+    // If not, proceed with sending the notification and updating the database
+    console.log(`New article found for "${row.keyword}". Proceeding with notification.`);
+
+    // 1. Perform sentiment analysis on the article heading
+    const sentimentResult = sentiment.analyze(articleHeading);
+    const sentimentScore = sentimentResult.score;
+    let sentimentSummary = 'Neutral';
+    if (sentimentScore > 0) {
+        sentimentSummary = 'Positive';
+    } else if (sentimentScore < 0) {
+        sentimentSummary = 'Negative';
+    }
+
+    // 2. Send the email notification with sentiment data
+    sendEmailNotification(row.website_url, row.keyword, articleHeading, articleLink, sentimentSummary, sentimentScore);
+
+    // 3. Update the database with the latest article URL
+    const updateQuery = `UPDATE monitored_sites SET last_notified_article = ?, notified = 'Y', last_notified = ? WHERE id = ?`;
+    const currentTime = new Date().toISOString();
+    db.run(updateQuery, [articleLink, currentTime, row.id], (err) => {
+        if (err) {
+            console.error('Error updating last_notified_article and notified status:', err.message);
+        } else {
+            console.log(`Updated last_notified_article and notified status for ${row.website_url}`);
+        }
+    });
+};
+
+
+
 
 // Email notification function
 const transporter = nodemailer.createTransport({
@@ -221,19 +253,19 @@ const transporter = nodemailer.createTransport({
 const sendEmailNotification = (website_url, keyword, articleHeading, articleLink, sentimentSummary, sentimentScore) => {
     const mailOptions = {
         from: '"Perseus Alerts" <proxmox1337@gmail.com>',  // Replace with your email
-        to: 'cestmoi1337@gmail.com',                       // Replace with the recipient's email
+        to: 'cestmoi1337@gmail.com',  // Replace with the recipient's email
         subject: `Keyword Alert: "${keyword}" found on ${website_url}`,
         html: `
             <p>The keyword <strong>"${keyword}"</strong> was found in the article titled:</p>
             <h2>${articleHeading}</h2>
-            <p>Sentiment analysis: <strong>${sentimentSummary}</strong> (Score: ${sentimentScore})</p>
+            <p>Sentiment analysis: <strong>${sentimentSummary}</strong> (score: ${sentimentScore})</p>
             <p>You can read the article by clicking <a href="${articleLink || website_url}">here</a>.</p>
         `
     };
 
     transporter.sendMail(mailOptions, (error, info) => {
         if (error) {
-            console.error('Error sending email:', error.message);
+            console.error(`Error sending email for ${website_url}:`, error.message);
         } else {
             console.log(`Email sent successfully: ${info.response}`);
         }
